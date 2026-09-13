@@ -1,0 +1,46 @@
+# Rendered by entrypoint.sh (envsubst) before nginx starts. ${API_UPSTREAM} / ${UI_UPSTREAM}
+# default to the ports fixed in ecosystem.config.js but can be overridden without a rebuild.
+server {
+    listen 8080;
+    server_name _;
+    client_max_body_size 50M;
+
+    # podview-api's own health checks are root-mounted there (src/modules/health), not under
+    # /api — proxied as-is so /health and /health/db keep answering exactly what the API returns.
+    location /health {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Every business/auth route podview-api serves is mounted under /api (src/routes.ts) —
+    # no trailing slash on proxy_pass, so nginx forwards the request URI unchanged and the
+    # /api prefix reaches the upstream intact.
+    location /api/ {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Swagger / OpenAPI docs
+    location /api-docs {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Everything else — the UI's SPA, its static assets, and client-side routing
+    location / {
+        proxy_pass http://${UI_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

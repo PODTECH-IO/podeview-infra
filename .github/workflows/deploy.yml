@@ -1,0 +1,84 @@
+name: Build and Deploy Consolidated Image
+
+run-name: Deploy consolidated (${{ github.event.client_payload.environment || inputs.environment }})
+
+on:
+  repository_dispatch:
+    types: [image-updated]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+concurrency:
+  # podview and podview-api can both land new images around the same time; only one
+  # consolidated build/deploy per environment runs at a time, the next one queues.
+  group: deploy-consolidated-${{ github.event.client_payload.environment || inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: ${{ github.event.client_payload.environment || inputs.environment }}
+  RESOURCE_GROUP: podview-rg
+  ACR_NAME: podviewacr
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.client_payload.environment || inputs.environment }}
+    steps:
+      - name: Checkout podeview-infra
+        uses: actions/checkout@v4
+
+      - name: Resolve target
+        id: resolve
+        run: echo "app_service=podview-app-$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy summary
+        run: |
+          echo "### Rebuilding consolidated image for **$ENVIRONMENT**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by: \`${{ github.event.client_payload.service || 'manual dispatch' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Target: App Service \`${{ steps.resolve.outputs.app_service }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build consolidated image in ACR
+        run: |
+          # UI_TAG/API_TAG pull whichever image currently carries each service's
+          # mutable per-environment tag — always "the latest push to $ENVIRONMENT for
+          # that service", regardless of which of the two repos triggered this run.
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "podview-consolidated:${{ github.sha }}" \
+            --image "podview-consolidated:$ENVIRONMENT" \
+            --build-arg UI_TAG=$ENVIRONMENT \
+            --build-arg API_TAG=$ENVIRONMENT \
+            --file Dockerfile .
+
+      - name: Deploy to App Service
+        run: |
+          ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query "passwords[0].value" -o tsv)
+          az webapp config container set \
+            --name "${{ steps.resolve.outputs.app_service }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --container-image-name "$ACR_NAME.azurecr.io/podview-consolidated:${{ github.sha }}" \
+            --container-registry-url "https://$ACR_NAME.azurecr.io" \
+            --container-registry-user "$ACR_NAME" \
+            --container-registry-password "$ACR_PASSWORD"
+          az webapp restart --name "${{ steps.resolve.outputs.app_service }}" --resource-group "$RESOURCE_GROUP"
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for deployment to stabilise..."
+          sleep 30
+          URL="https://${{ steps.resolve.outputs.app_service }}.azurewebsites.net/health"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+          echo "Health check ($URL): $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "::warning::Health check returned $STATUS"
+          fi
