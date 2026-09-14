@@ -43,6 +43,7 @@ COPY --from=api /app/package.json  ./api/package.json
 ARG API_GIT_SHA=unknown
 ENV API_GIT_SHA=${API_GIT_SHA}
 
+COPY nginx.conf /etc/nginx/nginx.conf
 COPY nginx.conf.template /etc/nginx/conf.d/default.conf.template
 COPY ecosystem.config.js ./
 COPY entrypoint.sh ./
