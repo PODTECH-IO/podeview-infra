@@ -34,7 +34,7 @@ jobs:
 
       - name: Resolve target
         id: resolve
-        run: echo "app_service=podview-app-$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+        run: echo "app_service=podview-$ENVIRONMENT" >> "$GITHUB_OUTPUT"
 
       - name: Deploy summary
         run: |
