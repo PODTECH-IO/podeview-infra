@@ -12,6 +12,7 @@ them into one container that runs both behind nginx via PM2.
 |---|---|
 | `Dockerfile` | Multi-stage: pulls `podview:<UI_TAG>` and `podview-api:<API_TAG>` from ACR, lifts each one's `dist/` + production `node_modules` into the final image |
 | `ecosystem.config.js` | PM2 process config — `podview-ui` on :4000, `podview-api` on :4001 |
+| `nginx.conf` | Main nginx config (events/http block) — ships explicitly because Alpine's own nginx package doesn't wire up `conf.d` the way Debian's does; see the file's own comment |
 | `nginx.conf.template` | Reverse proxy on :8080 — `/api/*`, `/api-docs`, `/health`, `/health/db` → podview-api; everything else → podview-ui |
 | `entrypoint.sh` | Container startup: renders the nginx template, starts nginx, then `pm2-runtime` in the foreground |
 
