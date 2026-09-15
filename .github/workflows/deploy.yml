@@ -95,8 +95,12 @@ jobs:
           echo "ref=$ACR_NAME.azurecr.io/podview-consolidated@$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to App Service
+        id: deploy
         run: |
           set -euo pipefail
+          # Recorded before the restart so the verify step can prove the container it
+          # eventually talks to was started by *this* deploy and is not the old one.
+          echo "started_at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
           ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query "passwords[0].value" -o tsv)
           # Deploy by immutable digest. A tag reference would be byte-identical between
           # runs, App Service would see no configuration change, and a plain restart
@@ -116,6 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           APP="${{ steps.resolve.outputs.app_service }}"
+          STARTED_AT=${{ steps.deploy.outputs.started_at }}
 
           # 1. The App Service must actually be configured with the digest we just built.
           CONFIGURED=$(az webapp config container show --name "$APP" \
@@ -127,16 +132,25 @@ jobs:
             *) echo "::error::App Service is on '$CONFIGURED', expected ${{ steps.built.outputs.digest }}"; exit 1 ;;
           esac
 
-          # 2. The new container must come up. Poll rather than sleeping a fixed 30s —
-          #    a digest change forces a fresh pull, which takes longer than a warm restart.
+          # 2. The *new* container must be the one serving. A plain 200 is not enough:
+          #    App Service keeps the previous container answering while it pulls and
+          #    swaps, so a naive health check goes green against the build being
+          #    replaced. /health reports process uptime, so the container is only
+          #    accepted once it reports an uptime shorter than the time since we
+          #    triggered the restart.
           URL="https://$APP.azurewebsites.net/health"
-          for attempt in $(seq 1 30); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$URL" || echo 000)
-            echo "Attempt $attempt — health check ($URL): $STATUS"
-            [ "$STATUS" = "200" ] && exit 0
+          for attempt in $(seq 1 60); do
+            BODY=$(curl -s --max-time 15 "$URL" || true)
+            UPTIME=$(printf '%s' "$BODY" | sed -n 's/.*"uptimeSeconds":\([0-9.]*\).*/\1/p' | cut -d. -f1)
+            ELAPSED=$(( $(date -u +%s) - STARTED_AT ))
+            echo "Attempt $attempt — elapsed ${ELAPSED}s, container uptime ${UPTIME:-none}s"
+            if [ -n "$UPTIME" ] && [ "$UPTIME" -lt "$ELAPSED" ]; then
+              echo "New container is serving (commit: $(printf '%s' "$BODY" | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p'))."
+              exit 0
+            fi
             sleep 10
           done
-          echo "::error::Health check never returned 200 after the deploy — $URL"
+          echo "::error::The new container never took over at $URL — the old build is still serving."
           exit 1
 
       - name: Deploy summary
