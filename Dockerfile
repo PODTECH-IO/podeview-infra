@@ -6,15 +6,19 @@
 # both behind nginx on a single Azure App Service.
 #
 # Usage:
-#   docker build --build-arg UI_TAG=dev --build-arg API_TAG=dev -t podview-consolidated:dev .
+#   docker build --build-arg UI_IMAGE=podviewacr.azurecr.io/podview:dev \
+#                --build-arg API_IMAGE=podviewacr.azurecr.io/podview-api:dev \
+#                -t podview-consolidated:dev .
 # ==============================================================================
 
-ARG UI_TAG=dev
-ARG API_TAG=dev
+# Full image references, so the pipeline can pin each source image by digest rather
+# than by its mutable per-environment tag. Defaults keep the plain tag-based build working.
+ARG UI_IMAGE=podviewacr.azurecr.io/podview:dev
+ARG API_IMAGE=podviewacr.azurecr.io/podview-api:dev
 
-# Pull the pre-built artifact images, pinned to the resolved tag for each service
-FROM podviewacr.azurecr.io/podview:${UI_TAG}      AS ui
-FROM podviewacr.azurecr.io/podview-api:${API_TAG} AS api
+# Pull the pre-built artifact images at the exact reference resolved for each service
+FROM ${UI_IMAGE}  AS ui
+FROM ${API_IMAGE} AS api
 
 # ==============================================================================
 # Final production image
