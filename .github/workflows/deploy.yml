@@ -34,51 +34,125 @@ jobs:
 
       - name: Resolve target
         id: resolve
-        run: echo "app_service=podview-$ENVIRONMENT" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy summary
         run: |
-          echo "### Rebuilding consolidated image for **$ENVIRONMENT**" >> "$GITHUB_STEP_SUMMARY"
-          echo "Triggered by: \`${{ github.event.client_payload.service || 'manual dispatch' }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Target: App Service \`${{ steps.resolve.outputs.app_service }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "app_service=podview-$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          # Build tag must be unique per run. It used to be github.sha — this repo's own
+          # commit — which is identical across runs, so the App Service container config
+          # never changed and Azure never repulled the freshly built image.
+          echo "build_tag=$ENVIRONMENT-${{ github.run_id }}.${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
 
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Resolve source image digests
+        id: sources
+        run: |
+          set -euo pipefail
+          UI_DIGEST=$(az acr repository show --name "$ACR_NAME" \
+            --image "podview:$ENVIRONMENT" --query digest -o tsv)
+          API_DIGEST=$(az acr repository show --name "$ACR_NAME" \
+            --image "podview-api:$ENVIRONMENT" --query digest -o tsv)
+
+          # Both source pipelines also tag each image with their repo's commit sha.
+          # Recover the API one so the Dockerfile can bake it in and /health reports a
+          # real commit instead of "unknown". Best effort — falls back to unknown.
+          API_GIT_SHA=$(az acr repository show-tags --name "$ACR_NAME" \
+            --repository podview-api --detail \
+            --query "[?digest=='$API_DIGEST'].name" -o tsv \
+            | grep -E '^[0-9a-f]{40}$' | head -n1 || true)
+
+          {
+            echo "ui_digest=$UI_DIGEST"
+            echo "api_digest=$API_DIGEST"
+            echo "api_git_sha=${API_GIT_SHA:-unknown}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build consolidated image in ACR
         run: |
-          # UI_TAG/API_TAG pull whichever image currently carries each service's
-          # mutable per-environment tag — always "the latest push to $ENVIRONMENT for
-          # that service", regardless of which of the two repos triggered this run.
+          set -euo pipefail
+          # Source images are pinned by digest, not by the mutable per-environment tag,
+          # so the assembled image is reproducible and provably matches what was resolved
+          # above rather than whatever the tag pointed at by the time the build ran.
           az acr build \
             --registry "$ACR_NAME" \
-            --image "podview-consolidated:${{ github.sha }}" \
+            --image "podview-consolidated:${{ steps.resolve.outputs.build_tag }}" \
             --image "podview-consolidated:$ENVIRONMENT" \
-            --build-arg UI_TAG=$ENVIRONMENT \
-            --build-arg API_TAG=$ENVIRONMENT \
+            --build-arg UI_IMAGE="$ACR_NAME.azurecr.io/podview@${{ steps.sources.outputs.ui_digest }}" \
+            --build-arg API_IMAGE="$ACR_NAME.azurecr.io/podview-api@${{ steps.sources.outputs.api_digest }}" \
+            --build-arg API_GIT_SHA="${{ steps.sources.outputs.api_git_sha }}" \
             --file Dockerfile .
+
+      - name: Resolve consolidated image digest
+        id: built
+        run: |
+          set -euo pipefail
+          DIGEST=$(az acr repository show --name "$ACR_NAME" \
+            --image "podview-consolidated:${{ steps.resolve.outputs.build_tag }}" \
+            --query digest -o tsv)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "ref=$ACR_NAME.azurecr.io/podview-consolidated@$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to App Service
         run: |
+          set -euo pipefail
           ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query "passwords[0].value" -o tsv)
+          # Deploy by immutable digest. A tag reference would be byte-identical between
+          # runs, App Service would see no configuration change, and a plain restart
+          # reuses the cached image — which is how new builds silently never shipped.
           az webapp config container set \
             --name "${{ steps.resolve.outputs.app_service }}" \
             --resource-group "$RESOURCE_GROUP" \
-            --container-image-name "$ACR_NAME.azurecr.io/podview-consolidated:${{ github.sha }}" \
+            --container-image-name "${{ steps.built.outputs.ref }}" \
             --container-registry-url "https://$ACR_NAME.azurecr.io" \
             --container-registry-user "$ACR_NAME" \
             --container-registry-password "$ACR_PASSWORD"
-          az webapp restart --name "${{ steps.resolve.outputs.app_service }}" --resource-group "$RESOURCE_GROUP"
+          az webapp restart \
+            --name "${{ steps.resolve.outputs.app_service }}" \
+            --resource-group "$RESOURCE_GROUP"
 
       - name: Verify deployment
         run: |
-          echo "Waiting for deployment to stabilise..."
-          sleep 30
-          URL="https://${{ steps.resolve.outputs.app_service }}.azurewebsites.net/health"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          echo "Health check ($URL): $STATUS"
-          if [ "$STATUS" != "200" ]; then
-            echo "::warning::Health check returned $STATUS"
-          fi
+          set -euo pipefail
+          APP="${{ steps.resolve.outputs.app_service }}"
+
+          # 1. The App Service must actually be configured with the digest we just built.
+          CONFIGURED=$(az webapp config container show --name "$APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?name=='DOCKER_CUSTOM_IMAGE_NAME'].value | [0]" -o tsv)
+          echo "Configured image: $CONFIGURED"
+          case "$CONFIGURED" in
+            *"${{ steps.built.outputs.digest }}") echo "Digest pinned correctly." ;;
+            *) echo "::error::App Service is on '$CONFIGURED', expected ${{ steps.built.outputs.digest }}"; exit 1 ;;
+          esac
+
+          # 2. The new container must come up. Poll rather than sleeping a fixed 30s —
+          #    a digest change forces a fresh pull, which takes longer than a warm restart.
+          URL="https://$APP.azurewebsites.net/health"
+          for attempt in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$URL" || echo 000)
+            echo "Attempt $attempt — health check ($URL): $STATUS"
+            [ "$STATUS" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::Health check never returned 200 after the deploy — $URL"
+          exit 1
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          {
+            echo "### Consolidated deploy — \`$ENVIRONMENT\`"
+            echo ""
+            echo "Triggered by: \`${{ github.event.client_payload.service || 'manual dispatch' }}\`"
+            echo "Target: App Service \`${{ steps.resolve.outputs.app_service }}\`"
+            echo ""
+            echo "| Component | Reference |"
+            echo "|---|---|"
+            echo "| UI (\`podview:$ENVIRONMENT\`) | \`${{ steps.sources.outputs.ui_digest }}\` |"
+            echo "| API (\`podview-api:$ENVIRONMENT\`) | \`${{ steps.sources.outputs.api_digest }}\` |"
+            echo "| API commit | \`${{ steps.sources.outputs.api_git_sha }}\` |"
+            echo "| Consolidated tag | \`${{ steps.resolve.outputs.build_tag }}\` |"
+            echo "| Deployed digest | \`${{ steps.built.outputs.digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

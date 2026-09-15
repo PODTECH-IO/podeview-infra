@@ -10,7 +10,7 @@ them into one container that runs both behind nginx via PM2.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Multi-stage: pulls `podview:<UI_TAG>` and `podview-api:<API_TAG>` from ACR, lifts each one's `dist/` + production `node_modules` into the final image |
+| `Dockerfile` | Multi-stage: pulls the images given by `UI_IMAGE` / `API_IMAGE` (digest-pinned by the pipeline) from ACR, lifts each one's `dist/` + production `node_modules` into the final image |
 | `ecosystem.config.js` | PM2 process config — `podview-ui` on :4000, `podview-api` on :4001 |
 | `nginx.conf` | Main nginx config (events/http block) — ships explicitly because Alpine's own nginx package doesn't wire up `conf.d` the way Debian's does; see the file's own comment |
 | `nginx.conf.template` | Reverse proxy on :8080 — `/api/*`, `/api-docs`, `/health`, `/health/db` → podview-api; everything else → podview-ui |
@@ -28,7 +28,9 @@ client can call `/api/...` with relative URLs.
 
 ```bash
 docker build \
-  --build-arg UI_TAG=dev --build-arg API_TAG=dev --build-arg API_GIT_SHA=$(git -C ../PODView-API rev-parse HEAD) \
+  --build-arg UI_IMAGE=podviewacr.azurecr.io/podview:dev \
+  --build-arg API_IMAGE=podviewacr.azurecr.io/podview-api:dev \
+  --build-arg API_GIT_SHA=$(git -C ../PODView-API rev-parse HEAD) \
   -t podview-consolidated:dev .
 ```
 
