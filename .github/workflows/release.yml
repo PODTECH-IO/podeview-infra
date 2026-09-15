@@ -1,0 +1,225 @@
+# ============================================================================
+#  podeview-infra/.github/workflows/release.yml   (the release)
+#
+#  Inputs: environment + one OPTIONAL field per service.
+#    blank  = keep whatever is currently deployed (from the state file).
+#             On the FIRST release for an env (no state file yet), blank
+#             resolves to the newest <env>-YYYYMMDD.N build in ACR and self-seeds.
+#    a tag  = deploy that exact <env>-YYYYMMDD.N build for that service.
+#  Explicit "latest" is rejected; the state file only ever stores real versions.
+#
+#  dev isn't offered here — it auto-deploys on every push via deploy.yml's
+#  repository_dispatch trigger and never produces dated builds to pick from.
+#
+#  Flow: resolve/validate -> assemble consolidated -> deploy -> health check ->
+#        commit updated state file.
+# ============================================================================
+name: Release PODVIEW
+run-name: Release ${{ inputs.environment }} (${{ github.actor }})
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [uat, prod]
+      podview:
+        description: "podview / UI (blank = keep current)"
+        type: string
+        default: ""
+      podview_api:
+        description: "podview-api / API (blank = keep current)"
+        type: string
+        default: ""
+
+concurrency:
+  group: release-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit the state file
+
+env:
+  ACR_NAME: podviewacr
+  RESOURCE_GROUP: podview-rg
+
+jobs:
+  # ---------------------------------------------------------------- RESOLVE
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.merge.outputs.versions }}
+    steps:
+      - name: Checkout (state file)
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Merge inputs over state + validate tags
+        id: merge
+        shell: bash
+        run: |
+          ENV="${{ inputs.environment }}"
+          STATE="environments/${ENV}/current-versions.json"
+          HAS_STATE=0; [ -f "$STATE" ] && HAS_STATE=1
+          declare -A REQ=(
+            [podview]="${{ inputs.podview }}"
+            [podview-api]="${{ inputs.podview_api }}"
+          )
+          {
+            echo "## Release plan → \`${ENV}\`"
+            [ "$HAS_STATE" = "0" ] && echo "_No state file yet — first release. Blank services pin to the newest build available._"
+            echo ""
+            echo "| Service | Current | This release | Change | Recent builds in ACR |"
+            echo "|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          JSON="{"; CHANGES=0
+          for s in podview podview-api; do
+            TAGS=$(az acr repository show-tags --name "$ACR_NAME" --repository "${s}" \
+              --orderby time_desc --top 50 -o tsv 2>/dev/null \
+              | grep -E "^${ENV}-[0-9]{8}\.[0-9]+\$" || true)
+            NEWEST=$(echo "$TAGS" | head -1)
+            RECENT=$(echo "$TAGS" | head -6 | paste -sd ', ' -); [ -z "$RECENT" ] && RECENT="(none)"
+            CURRENT=""
+            [ "$HAS_STATE" = "1" ] && CURRENT=$(jq -r --arg s "$s" '.services[$s] // empty' "$STATE")
+            WANT="${REQ[$s]}"; WANT="${WANT// /}"
+            if [ -z "$WANT" ]; then
+              if [ -n "$CURRENT" ]; then
+                FINAL="$CURRENT"; MARK="—"
+              elif [ -n "$NEWEST" ]; then
+                FINAL="$NEWEST"; MARK="↪ newest (first release)"
+              else
+                echo "::error::${s}: no ${ENV}-YYYYMMDD.N builds in ACR for ${s} — build this service first"
+                exit 1
+              fi
+            else
+              if [ "$WANT" = "latest" ] || ! [[ "$WANT" =~ ^${ENV}-[0-9]{8}\.[0-9]+$ ]]; then
+                echo "::error::${s}: '${WANT}' is not a valid version (expected ${ENV}-YYYYMMDD.N; 'latest' not allowed)"
+                exit 1
+              fi
+              if ! az acr repository show --name "$ACR_NAME" --image "${s}:${WANT}" >/dev/null 2>&1; then
+                echo "::error::${s}: tag '${WANT}' does not exist in ACR for ${s}"
+                exit 1
+              fi
+              FINAL="$WANT"
+              if [ "$WANT" = "$CURRENT" ]; then MARK="(same as current)"; else MARK="⬆ ${CURRENT:-none} → ${WANT}"; CHANGES=$((CHANGES+1)); fi
+            fi
+            JSON+="\"${s}\":\"${FINAL}\","
+            echo "| \`${s}\` | \`${CURRENT:-—}\` | \`${FINAL}\` | ${MARK} | ${RECENT} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          JSON="${JSON%,}}"
+          if [ "$HAS_STATE" = "1" ] && [ "$CHANGES" = "0" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **No service changes requested** — redeploying the current set as-is." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "versions=${JSON}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- RELEASE
+  release:
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # deployment history
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout infra
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Resolve consolidated release tag
+        id: vars
+        shell: bash
+        run: |
+          ENV="${{ inputs.environment }}"
+          echo "app_service=podview-app-${ENV}" >> "$GITHUB_OUTPUT"
+          DATE=$(date -u +%Y%m%d)
+          EXISTING=$(az acr repository show-tags --name "$ACR_NAME" --repository podview-consolidated \
+            --query "[?starts_with(@, '${ENV}-${DATE}.')]" -o tsv 2>/dev/null || true)
+          MAX=0
+          for t in $EXISTING; do N="${t##*.}"; [[ "$N" =~ ^[0-9]+$ ]] && (( N > MAX )) && MAX=$N; done
+          echo "tag=${ENV}-${DATE}.$((MAX + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble consolidated image (pinned per service)
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "podview-consolidated:${{ steps.vars.outputs.tag }}" \
+            --image "podview-consolidated:${{ inputs.environment }}" \
+            --build-arg UI_TAG=${{ fromJSON(needs.resolve.outputs.versions)['podview'] }} \
+            --build-arg API_TAG=${{ fromJSON(needs.resolve.outputs.versions)['podview-api'] }} \
+            --file Dockerfile .
+
+      # TODO: no maintenance-mode toggle here yet — nginx.conf.template/entrypoint.sh don't
+      # support it (unlike reportzero-infra's MAINTENANCE_MODE flag). This deploys straight
+      # through; add that support first if a maintenance page is wanted around releases.
+      - name: Deploy consolidated image
+        run: |
+          ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query "passwords[0].value" -o tsv)
+          az webapp config container set \
+            --name "${{ steps.vars.outputs.app_service }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --container-image-name "$ACR_NAME.azurecr.io/podview-consolidated:${{ steps.vars.outputs.tag }}" \
+            --container-registry-url "https://$ACR_NAME.azurecr.io" \
+            --container-registry-user "$ACR_NAME" \
+            --container-registry-password "$ACR_PASSWORD"
+          az webapp restart --name "${{ steps.vars.outputs.app_service }}" --resource-group "$RESOURCE_GROUP"
+
+      - name: Health check
+        shell: bash
+        run: |
+          HEALTHY=0
+          for i in $(seq 1 12); do
+            sleep 15
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://${{ steps.vars.outputs.app_service }}.azurewebsites.net/health" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            [ "$STATUS" = "200" ] && { HEALTHY=1; break; }
+          done
+          [ "$HEALTHY" = "1" ] || { echo "::error::Health check never returned 200"; exit 1; }
+
+  # ------------------------------------------------------------ UPDATE STATE
+  update-state:
+    needs: [resolve, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write & commit state file
+        shell: bash
+        run: |
+          ENV="${{ inputs.environment }}"
+          STATE="environments/${ENV}/current-versions.json"
+          mkdir -p "environments/${ENV}"
+          jq -n \
+            --arg environment "$ENV" \
+            --arg releaseTag "${{ needs.release.outputs.tag }}" \
+            --arg updatedAt "$(date -u +%FT%TZ)" \
+            --arg updatedBy "${{ github.actor }}" \
+            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson services '${{ needs.resolve.outputs.versions }}' \
+            '{environment:$environment, releaseTag:$releaseTag, updatedAt:$updatedAt, updatedBy:$updatedBy, runUrl:$runUrl, services:$services}' \
+            > "$STATE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE"
+          git commit -m "release(${ENV}): ${{ needs.release.outputs.tag }} [skip ci]" || { echo "no change"; exit 0; }
+          for i in 1 2 3; do git push && break; git pull --rebase && sleep 2; done
+
+      - name: Summary
+        run: |
+          {
+            echo "### Released \`podview-consolidated:${{ needs.release.outputs.tag }}\` → **${{ inputs.environment }}**"
+            echo ""
+            echo '```json'
+            echo '${{ needs.resolve.outputs.versions }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

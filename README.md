@@ -42,3 +42,14 @@ takes a manual `workflow_dispatch` with an `environment` input.
 See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full picture: required secrets, the one-time `az`
 setup for the three consolidated App Services (`podview-app-dev/uat/prod` — none of which exist
 yet), and why they're new names rather than reusing today's split-deployment resources.
+
+## Releasing to uat/prod
+
+`podview` and `podview-api`'s own `deploy-uat.yml`/`deploy-prod.yml` only build and tag images
+(`<env>-<YYYYMMDD>.<N>`, e.g. `uat-20260915.1`) — nothing auto-deploys there, unlike dev.
+`.github/workflows/release.yml` is the promotion step, modeled on
+[reportzero-infra's release.yml](https://github.com/PODTECH-IO/reportzero-infra/blob/main/.github/workflows/release.yml):
+run it manually (`workflow_dispatch`) with an environment and, optionally, a specific tag per
+service (blank keeps whatever's currently released). It resolves the versions, builds the
+consolidated image pinned to exactly those, deploys it, health-checks it, and commits the result
+to `environments/<env>/current-versions.json` so the next release knows what "current" means.
