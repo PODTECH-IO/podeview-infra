@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           ENV="${{ inputs.environment }}"
-          echo "app_service=podview-app-${ENV}" >> "$GITHUB_OUTPUT"
+          echo "app_service=podview-${ENV}" >> "$GITHUB_OUTPUT"
           DATE=$(date -u +%Y%m%d)
           EXISTING=$(az acr repository show-tags --name "$ACR_NAME" --repository podview-consolidated \
             --query "[?starts_with(@, '${ENV}-${DATE}.')]" -o tsv 2>/dev/null || true)
@@ -158,12 +158,16 @@ jobs:
           echo "tag=${ENV}-${DATE}.$((MAX + 1))" >> "$GITHUB_OUTPUT"
       - name: Assemble consolidated image (pinned per service)
         run: |
+          # Dockerfile takes full image refs (UI_IMAGE/API_IMAGE), not bare tags — an
+          # unconsumed build-arg doesn't fail the build, it silently falls back to the
+          # ARG's own default (podview:dev / podview-api:dev), so a name mismatch here
+          # would build and ship the wrong images without any error.
           az acr build \
             --registry "$ACR_NAME" \
             --image "podview-consolidated:${{ steps.vars.outputs.tag }}" \
             --image "podview-consolidated:${{ inputs.environment }}" \
-            --build-arg UI_TAG=${{ needs.resolve.outputs.podview_version }} \
-            --build-arg API_TAG=${{ needs.resolve.outputs.podview_api_version }} \
+            --build-arg UI_IMAGE="$ACR_NAME.azurecr.io/podview:${{ needs.resolve.outputs.podview_version }}" \
+            --build-arg API_IMAGE="$ACR_NAME.azurecr.io/podview-api:${{ needs.resolve.outputs.podview_api_version }}" \
             --file Dockerfile .
       # TODO: no maintenance-mode toggle here yet — nginx.conf.template/entrypoint.sh don't
       # support it (unlike reportzero-infra's MAINTENANCE_MODE flag). This deploys straight
