@@ -49,7 +49,8 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     outputs:
-      versions: ${{ steps.merge.outputs.versions }}
+      podview_version: ${{ steps.merge.outputs.podview_version }}
+      podview_api_version: ${{ steps.merge.outputs.podview_api_version }}
     steps:
       - name: Checkout (state file)
         uses: actions/checkout@v4
@@ -70,6 +71,7 @@ jobs:
             [podview]="${{ inputs.podview }}"
             [podview-api]="${{ inputs.podview_api }}"
           )
+          declare -A RESULT
           {
             echo "## Release plan → \`${ENV}\`"
             [ "$HAS_STATE" = "0" ] && echo "_No state file yet — first release. Blank services pin to the newest build available._"
@@ -77,7 +79,7 @@ jobs:
             echo "| Service | Current | This release | Change | Recent builds in ACR |"
             echo "|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          JSON="{"; CHANGES=0
+          CHANGES=0
           for s in podview podview-api; do
             TAGS=$(az acr repository show-tags --name "$ACR_NAME" --repository "${s}" \
               --orderby time_desc --top 50 -o tsv 2>/dev/null \
@@ -108,16 +110,17 @@ jobs:
               FINAL="$WANT"
               if [ "$WANT" = "$CURRENT" ]; then MARK="(same as current)"; else MARK="⬆ ${CURRENT:-none} → ${WANT}"; CHANGES=$((CHANGES+1)); fi
             fi
-            JSON+="\"${s}\":\"${FINAL}\","
+            RESULT[$s]="$FINAL"
             echo "| \`${s}\` | \`${CURRENT:-—}\` | \`${FINAL}\` | ${MARK} | ${RECENT} |" >> "$GITHUB_STEP_SUMMARY"
           done
-          JSON="${JSON%,}}"
           if [ "$HAS_STATE" = "1" ] && [ "$CHANGES" = "0" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "⚠️ **No service changes requested** — redeploying the current set as-is." >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "versions=${JSON}" >> "$GITHUB_OUTPUT"
-
+          # Two plain outputs instead of one JSON blob — nothing downstream
+          # needs fromJSON(), so there's no JSON-parsing step left to break.
+          echo "podview_version=${RESULT[podview]}" >> "$GITHUB_OUTPUT"
+          echo "podview_api_version=${RESULT[podview-api]}" >> "$GITHUB_OUTPUT"
   # ---------------------------------------------------------------- RELEASE
   release:
     needs: resolve
@@ -126,6 +129,13 @@ jobs:
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
     steps:
+      - name: Guard against empty resolve outputs
+        run: |
+          if [ -z "${{ needs.resolve.outputs.podview_version }}" ] || [ -z "${{ needs.resolve.outputs.podview_api_version }}" ]; then
+            echo "::error::resolve job produced an empty version for at least one service — podview_version='${{ needs.resolve.outputs.podview_version }}' podview_api_version='${{ needs.resolve.outputs.podview_api_version }}'. If you just edited this workflow, use 'Re-run all jobs', not 'Re-run failed jobs' — the latter reuses resolve's outputs from the earlier attempt."
+            exit 1
+          fi
+
       - name: Checkout infra
         uses: actions/checkout@v4
 
@@ -146,17 +156,15 @@ jobs:
           MAX=0
           for t in $EXISTING; do N="${t##*.}"; [[ "$N" =~ ^[0-9]+$ ]] && (( N > MAX )) && MAX=$N; done
           echo "tag=${ENV}-${DATE}.$((MAX + 1))" >> "$GITHUB_OUTPUT"
-
       - name: Assemble consolidated image (pinned per service)
         run: |
           az acr build \
             --registry "$ACR_NAME" \
             --image "podview-consolidated:${{ steps.vars.outputs.tag }}" \
             --image "podview-consolidated:${{ inputs.environment }}" \
-            --build-arg UI_TAG=${{ fromJSON(needs.resolve.outputs.versions)['podview'] }} \
-            --build-arg API_TAG=${{ fromJSON(needs.resolve.outputs.versions)['podview-api'] }} \
+            --build-arg UI_TAG=${{ needs.resolve.outputs.podview_version }} \
+            --build-arg API_TAG=${{ needs.resolve.outputs.podview_api_version }} \
             --file Dockerfile .
-
       # TODO: no maintenance-mode toggle here yet — nginx.conf.template/entrypoint.sh don't
       # support it (unlike reportzero-infra's MAINTENANCE_MODE flag). This deploys straight
       # through; add that support first if a maintenance page is wanted around releases.
@@ -171,7 +179,6 @@ jobs:
             --container-registry-user "$ACR_NAME" \
             --container-registry-password "$ACR_PASSWORD"
           az webapp restart --name "${{ steps.vars.outputs.app_service }}" --resource-group "$RESOURCE_GROUP"
-
       - name: Health check
         shell: bash
         run: |
@@ -184,7 +191,6 @@ jobs:
             [ "$STATUS" = "200" ] && { HEALTHY=1; break; }
           done
           [ "$HEALTHY" = "1" ] || { echo "::error::Health check never returned 200"; exit 1; }
-
   # ------------------------------------------------------------ UPDATE STATE
   update-state:
     needs: [resolve, release]
@@ -205,21 +211,21 @@ jobs:
             --arg updatedAt "$(date -u +%FT%TZ)" \
             --arg updatedBy "${{ github.actor }}" \
             --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson services '${{ needs.resolve.outputs.versions }}' \
-            '{environment:$environment, releaseTag:$releaseTag, updatedAt:$updatedAt, updatedBy:$updatedBy, runUrl:$runUrl, services:$services}' \
+            --arg podviewVersion "${{ needs.resolve.outputs.podview_version }}" \
+            --arg podviewApiVersion "${{ needs.resolve.outputs.podview_api_version }}" \
+            '{environment:$environment, releaseTag:$releaseTag, updatedAt:$updatedAt, updatedBy:$updatedBy, runUrl:$runUrl,
+              services:{podview:$podviewVersion, "podview-api":$podviewApiVersion}}' \
             > "$STATE"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$STATE"
           git commit -m "release(${ENV}): ${{ needs.release.outputs.tag }} [skip ci]" || { echo "no change"; exit 0; }
           for i in 1 2 3; do git push && break; git pull --rebase && sleep 2; done
-
       - name: Summary
         run: |
           {
             echo "### Released \`podview-consolidated:${{ needs.release.outputs.tag }}\` → **${{ inputs.environment }}**"
             echo ""
-            echo '```json'
-            echo '${{ needs.resolve.outputs.versions }}'
-            echo '```'
+            echo "- podview: \`${{ needs.resolve.outputs.podview_version }}\`"
+            echo "- podview-api: \`${{ needs.resolve.outputs.podview_api_version }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
