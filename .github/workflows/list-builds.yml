@@ -1,0 +1,56 @@
+# ============================================================================
+#  podeview-infra/.github/workflows/list-builds.yml
+#  Pick an environment -> lists the last 5 build versions (<env>-YYYYMMDD.N)
+#  in ACR for podview (UI) and podview-api. Read-only, no deploy, no state
+#  file. Use this to find the tag to pass into release.yml's podview /
+#  podview_api inputs.
+# ============================================================================
+name: List builds
+run-name: List builds → ${{ inputs.environment }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [uat, prod]
+
+env:
+  ACR_NAME: podviewacr
+  SERVICES: "podview podview-api"
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: List last 5 builds per service
+        shell: bash
+        run: |
+          ENV="${{ inputs.environment }}"
+          {
+            echo "## Last 5 builds → \`${ENV}\`"
+            echo ""
+            echo "| Service | Latest | Previous 4 |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for s in $SERVICES; do
+            TAGS=$(az acr repository show-tags --name "$ACR_NAME" --repository "$s" \
+              --orderby time_desc --top 30 -o tsv 2>/dev/null \
+              | grep -E "^${ENV}-[0-9]{8}\.[0-9]+\$" | head -5) || TAGS=""
+            if [ -z "$TAGS" ]; then
+              echo "| \`${s}\` | (none found) | — |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            LATEST=$(echo "$TAGS" | head -1)
+            REST=$(echo "$TAGS" | tail -n +2 | paste -sd ', ' -)
+            [ -z "$REST" ] && REST="—"
+            echo "| \`${s}\` | \`${LATEST}\` | ${REST} |" >> "$GITHUB_STEP_SUMMARY"
+          done
