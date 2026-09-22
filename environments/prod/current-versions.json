@@ -1,0 +1,11 @@
+{
+  "environment": "prod",
+  "releaseTag": "prod-20260922.2",
+  "updatedAt": "2026-09-22T09:55:17Z",
+  "updatedBy": "Utkarsh8671",
+  "runUrl": "https://github.com/PODTECH-IO/podeview-infra/actions/runs/35712825194",
+  "services": {
+    "podview": "prod-20260922.1",
+    "podview-api": "prod-20260922.1"
+  }
+}
