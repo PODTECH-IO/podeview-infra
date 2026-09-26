@@ -106,6 +106,15 @@ jobs:
             --container-registry-url "https://$ACR_NAME.azurecr.io" \
             --container-registry-user "$ACR_NAME" \
             --container-registry-password "$ACR_PASSWORD"
+          # Idempotent — cheap to call every run. Without this, the container's own
+          # stdout/stderr (startup errors, crash traces) is discarded entirely, and
+          # 'az webapp log tail' has nothing app-specific to show when a deploy needs
+          # debugging.
+          az webapp log config \
+            --name "${{ steps.resolve.outputs.app_service }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --docker-container-logging filesystem \
+            --output none
           az webapp restart \
             --name "${{ steps.resolve.outputs.app_service }}" \
             --resource-group "$RESOURCE_GROUP"
@@ -114,6 +123,12 @@ jobs:
           set -euo pipefail
           APP="${{ steps.resolve.outputs.app_service }}"
           STARTED_AT=${{ steps.deploy.outputs.started_at }}
+          # 0. Cheap sanity check first: if the App Service itself isn't Running (stopped,
+          #    quota/billing issue, etc.), no amount of waiting on /health will help, and
+          #    this says so immediately instead of burning the full 10-minute loop below.
+          STATE=$(az webapp show --name "$APP" --resource-group "$RESOURCE_GROUP" --query state -o tsv)
+          echo "App Service state: $STATE"
+          [ "$STATE" = "Running" ] || echo "::warning::App Service state is '$STATE', not 'Running'."
           # 1. The App Service must actually be configured with the digest we just built.
           CONFIGURED=$(az webapp config container show --name "$APP" \
             --resource-group "$RESOURCE_GROUP" \
@@ -139,30 +154,50 @@ jobs:
           #    parsing mismatch are no longer indistinguishable in the log.
           URL="https://$APP.azurewebsites.net/health"
           for attempt in $(seq 1 60); do
-            HTTP_CODE=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" --max-time 15 "$URL" || echo "000")
+            HTTP_CODE=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" --max-time 15 "$URL" 2>/tmp/curl_err.txt || echo "000")
             BODY=$(cat /tmp/health_body.txt 2>/dev/null || true)
-            UPTIME=$(printf '%s' "$BODY" | jq -r '.uptimeSeconds // empty' 2>/dev/null | cut -d. -f1)
+            # jq exits non-zero on a body that isn't valid JSON (e.g. Azure's own
+            # "starting up" page while the new container is still being pulled) — with
+            # pipefail that would otherwise abort this whole step via set -e on what's
+            # meant to be a normal, expected early attempt. The trailing `|| true`
+            # makes "couldn't parse it" resolve to an empty UPTIME instead of a crash.
+            UPTIME=$( (printf '%s' "$BODY" | jq -r '.uptimeSeconds // empty' 2>/dev/null | cut -d. -f1) || true)
             ELAPSED=$(( $(date -u +%s) - STARTED_AT ))
             echo "Attempt $attempt — elapsed ${ELAPSED}s, HTTP ${HTTP_CODE}, container uptime ${UPTIME:-none}s"
             echo "  raw body: ${BODY:0:300}"
+            # HTTP 000 means curl never got a response at all (DNS, TLS, connection
+            # refused, timeout) rather than the app answering with an error page —
+            # worth telling apart, since one points at Azure/networking and the other
+            # at the app itself.
+            [ "$HTTP_CODE" = "000" ] && echo "  curl error: $(cat /tmp/curl_err.txt 2>/dev/null)"
             if [ -n "$UPTIME" ] && [ "$UPTIME" -lt "$ELAPSED" ]; then
-              COMMIT=$(printf '%s' "$BODY" | jq -r '.commit // "unknown"' 2>/dev/null)
+              COMMIT=$( (printf '%s' "$BODY" | jq -r '.commit // "unknown"' 2>/dev/null) || true)
               echo "New container is serving (commit: $COMMIT)."
               exit 0
             fi
             sleep 10
           done
           echo "::error::$URL never reported an uptime below the elapsed time after 10 minutes."
-          echo "::error::Either the new container never came up (check 'az webapp log tail'), or /health's response shape doesn't match what this check expects — see the raw body logged above."
+          echo "::error::Either the new container never came up, or /health's response shape doesn't match what this check expects — see the raw body logged above."
+          # Pull whatever the container has already logged to stdout/stderr straight into
+          # this run, instead of leaving that for a separate manual 'az webapp log tail'
+          # after the fact. Bounded with 'timeout' since log tail streams forever otherwise;
+          # 25s is enough to catch whatever is already buffered (startup errors show up
+          # immediately, they don't need to be caught live).
+          echo "::group::Recent container log output (up to 25s capture)"
+          timeout 25 az webapp log tail --name "$APP" --resource-group "$RESOURCE_GROUP" 2>&1 | tail -n 200 || true
+          echo "::endgroup::"
           exit 1
       - name: Deploy summary
         if: always()
         run: |
+          SUB_ID=$(az account show --query id -o tsv 2>/dev/null || true)
+          APP="${{ steps.resolve.outputs.app_service }}"
           {
             echo "### Consolidated deploy — \`$ENVIRONMENT\`"
             echo ""
             echo "Triggered by: \`${{ github.event.client_payload.service || 'manual dispatch' }}\`"
-            echo "Target: App Service \`${{ steps.resolve.outputs.app_service }}\`"
+            echo "Target: App Service \`$APP\`"
             echo ""
             echo "| Component | Reference |"
             echo "|---|---|"
@@ -171,4 +206,8 @@ jobs:
             echo "| API commit | \`${{ steps.sources.outputs.api_git_sha }}\` |"
             echo "| Consolidated tag | \`${{ steps.resolve.outputs.build_tag }}\` |"
             echo "| Deployed digest | \`${{ steps.built.outputs.digest }}\` |"
+            if [ -n "$SUB_ID" ]; then
+              echo ""
+              echo "[Log stream](https://portal.azure.com/#@/resource/subscriptions/$SUB_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP/logStream) · [Container settings](https://portal.azure.com/#@/resource/subscriptions/$SUB_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP/containerSettings)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
