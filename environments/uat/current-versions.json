@@ -1,11 +1,11 @@
 {
   "environment": "uat",
-  "releaseTag": "uat-20260928.1",
-  "updatedAt": "2026-09-28T12:40:45Z",
+  "releaseTag": "uat-20261001.1",
+  "updatedAt": "2026-10-01T13:02:23Z",
   "updatedBy": "Utkarsh8671",
-  "runUrl": "https://github.com/PODTECH-IO/podeview-infra/actions/runs/36423055259",
+  "runUrl": "https://github.com/PODTECH-IO/podeview-infra/actions/runs/36865203577",
   "services": {
-    "podview": "uat-20260928.1",
-    "podview-api": "uat-20260928.1"
+    "podview": "uat-20261001.1",
+    "podview-api": "uat-20261001.1"
   }
 }
